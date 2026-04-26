@@ -291,7 +291,7 @@ def run_mineru(pdf_path):
     env["PYTORCH_CUDA_ALLOC_CONF"]   = "max_split_size_mb:512"
 
     result = subprocess.run(
-        ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "hybrid-auto-engine"],
+        ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "hybrid-auto-engine", "--device", "cuda"]
         env=env,
         capture_output=True,
         text=True
