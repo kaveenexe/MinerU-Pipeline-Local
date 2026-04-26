@@ -1,0 +1,9 @@
+# CSE Quarterly Report Pipeline — Dependencies
+# Install with: uv pip install -r requirements.txt
+
+mysql-connector-python
+pandas
+openpyxl
+requests
+python-dotenv
+google-generativeai
