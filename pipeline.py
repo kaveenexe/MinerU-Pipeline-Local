@@ -32,12 +32,12 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
+    "host":     os.getenv("DB_HOST", "mysql.railway.internal"),
     "port":     int(os.getenv("DB_PORT", 3306)),
     "user":     os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "root"),
+    "password": os.getenv("DB_PASSWORD", "vGYSrCJEbvGLdTijaSpWIQMRUJlHjuNl"),
 }
-DB_NAME          = os.getenv("DB_NAME", "mineru_cse")
+DB_NAME          = os.getenv("DB_NAME", "railway")
 PDF_BASE_URL     = os.getenv("PDF_BASE_URL", "https://cdn.cse.lk/")
 PDF_DIR          = Path(os.getenv("PDF_DIR", "pdfs"))
 OUTPUT_DIR       = Path(os.getenv("OUTPUT_DIR", "output"))
@@ -587,13 +587,32 @@ def run_kpi_only(companies_xlsx, limit):
     print(f"\n[✓] KPI extraction complete — {total} reports processed")
 
 
-def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False):
-    global _shutdown
+# ── Worker entry point (must be module-level to be picklable) ─────────────────
+def _worker_entry(args_tuple):
+    """
+    Entry point for each ProcessPoolExecutor worker subprocess.
+    On Linux (RunPod), fork is used so all globals (DB_CONFIG, paths, etc.)
+    are already inherited from the parent — no re-init needed.
+    """
+    symbols, quarterly_limit, skip_kpi, worker_id = args_tuple
 
-    df = pd.read_excel(companies_xlsx)
-    df.columns = [c.strip() for c in df.columns]
-    symbols = df["Symbol"].dropna().str.strip().tolist()
-    print(f"[✓] Loaded {len(symbols)} companies | limit={quarterly_limit} quarters each\n")
+    # Let the parent process handle Ctrl-C; workers just finish their current PDF
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    print(f"\n[W{worker_id}] Started — {len(symbols)} companies assigned")
+    _process_symbols(symbols, quarterly_limit, skip_kpi, worker_id)
+
+
+# ── Core per-company loop ─────────────────────────────────────────────────────
+def _process_symbols(symbols, quarterly_limit, skip_kpi=False, worker_id=0):
+    """
+    Processes a list of company symbols end-to-end:
+      download → MinerU → store → (optional KPI) → disk cleanup.
+    Called directly for single-worker mode; called inside _worker_entry for
+    multi-worker mode so each subprocess has its own DB connection.
+    """
+    global _shutdown
+    pfx = f"[W{worker_id}] " if worker_id > 0 else ""
 
     PDF_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -606,11 +625,11 @@ def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False):
         if _shutdown:
             break
 
-        print(f"[{ci:>3}/{total}] {symbol}")
+        print(f"{pfx}[{ci:>3}/{total}] {symbol}")
 
         reports = fetch_quarterly_reports(symbol, quarterly_limit)
         if not reports:
-            print(f"  [!] No quarterly data — skipping")
+            print(f"{pfx}  [!] No quarterly data — skipping")
             continue
 
         cur.execute("INSERT IGNORE INTO companies (symbol) VALUES (%s)", (symbol,))
@@ -626,10 +645,10 @@ def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False):
             state     = get_state(cur, symbol, cse_id)
 
             if state in ("completed", "deleted"):
-                print(f"  [skip] {file_text[:65]} ({state})")
+                print(f"{pfx}  [skip] {file_text[:65]} ({state})")
                 continue
 
-            print(f"  ↳ {file_text[:70]}")
+            print(f"{pfx}  ↳ {file_text[:70]}")
 
             if state is None:
                 set_state(cur, symbol, cse_id, "queued", file_text, pdf_url)
@@ -640,16 +659,16 @@ def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False):
             pdf_local_path = None
             if state == "queued":
                 try:
-                    print(f"    [1/3] Downloading...")
+                    print(f"{pfx}    [1/3] Downloading...")
                     pdf_local_path = download_pdf(symbol, report)
                     set_state(cur, symbol, cse_id, "pdf_downloaded", file_text, pdf_url)
                     conn.commit()
                     state = "pdf_downloaded"
-                    print(f"    [✓] Saved: {pdf_local_path}")
+                    print(f"{pfx}    [✓] Saved: {pdf_local_path}")
                 except Exception as e:
                     set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                     conn.commit()
-                    print(f"    [✗] Download failed: {e}")
+                    print(f"{pfx}    [✗] Download failed: {e}")
                     continue
             else:
                 cur.execute(
@@ -662,49 +681,48 @@ def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False):
                     pdf_local_path = row[0]
                 else:
                     try:
-                        print(f"    [1/3] Re-downloading (file missing)...")
+                        print(f"{pfx}    [1/3] Re-downloading (file missing)...")
                         pdf_local_path = download_pdf(symbol, report)
                         state = "pdf_downloaded"
                     except Exception as e:
                         set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                         conn.commit()
-                        print(f"    [✗] Re-download failed: {e}")
+                        print(f"{pfx}    [✗] Re-download failed: {e}")
                         continue
 
             # ── Step 2: MinerU Extraction ─────────────────────
             if state in ("queued", "pdf_downloaded"):
                 try:
-                    print(f"    [2/3] Running MinerU...")
+                    print(f"{pfx}    [2/3] Running MinerU...")
                     run_mineru(pdf_local_path)
                     set_state(cur, symbol, cse_id, "mineru_extracted", file_text, pdf_url)
                     conn.commit()
                     state = "mineru_extracted"
-                    print(f"    [✓] Extraction complete")
+                    print(f"{pfx}    [✓] Extraction complete")
                 except Exception as e:
                     set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                     conn.commit()
-                    print(f"    [✗] MinerU failed: {e}")
+                    print(f"{pfx}    [✗] MinerU failed: {e}")
                     continue
 
             # ── Step 3: Store in MySQL ────────────────────────
             if state in ("queued", "pdf_downloaded", "mineru_extracted"):
                 try:
-                    print(f"    [3/3] Storing in MySQL...")
+                    print(f"{pfx}    [3/3] Storing in MySQL...")
                     n = store_report(conn, cur, symbol, report, pdf_local_path)
                     set_state(cur, symbol, cse_id, "completed", file_text, pdf_url)
                     conn.commit()
-                    print(f"    [✓] Stored {n} blocks")
+                    print(f"{pfx}    [✓] Stored {n} blocks")
 
+                    # ── Step 4: KPI extraction (optional) ────────────────────
                     if skip_kpi:
-                        print(f"    [skip] KPI step skipped (--no-kpi flag)")
+                        print(f"{pfx}    [skip] KPI step skipped (--no-kpi flag)")
                     else:
-    # ── Step 4: KPI extraction via Gemini ──────────────
                         _, v2_path, _ = find_output_files(pdf_local_path)
                         if v2_path and v2_path.exists():
                             try:
-                                print(f"    [4/4] Extracting KPIs via Gemini...")
+                                print(f"{pfx}    [4/4] Extracting KPIs via Gemini...")
                                 period_label = f"report-{cse_id}"
-                                # Get the report DB id for FK
                                 cur.execute(
                                     "SELECT id FROM reports WHERE company_symbol=%s AND cse_report_id=%s",
                                     (symbol, cse_id)
@@ -716,24 +734,70 @@ def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False):
                                 conn.commit()
                                 t1 = sum(1 for v in kpi_result.get("tier1", {}).values() if v is not None)
                                 t2 = len(kpi_result.get("tier2", {}))
-                                print(f"    [✓] KPIs: {t1} Tier1, {t2} Tier2")
+                                print(f"{pfx}    [✓] KPIs: {t1} Tier1, {t2} Tier2")
                             except Exception as ke:
-                                print(f"    [!] KPI extraction failed (non-fatal): {ke}")
+                                print(f"{pfx}    [!] KPI extraction failed (non-fatal): {ke}")
                         else:
-                            print(f"    [!] content_list_v2.json not found, skipping KPI step")
+                            print(f"{pfx}    [!] content_list_v2.json not found, skipping KPI step")
+
+                    # ── Disk cleanup: remove MinerU output to preserve disk ───
+                    out_stem = OUTPUT_DIR / Path(pdf_local_path).stem
+                    if out_stem.exists():
+                        shutil.rmtree(out_stem)
+                        print(f"{pfx}    [✓] MinerU output cleaned (disk freed)")
+
                 except Exception as e:
                     set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                     conn.commit()
-                    print(f"    [✗] Storage failed: {e}")
+                    print(f"{pfx}    [✗] Storage failed: {e}")
                     continue
 
     cur.close()
     conn.close()
 
     if _shutdown:
-        print("\n[!] Pipeline paused safely. Run again to resume from where you left off.")
+        print(f"\n{pfx}Pipeline paused safely. Run again to resume.")
     else:
-        print("\n[✓] Pipeline complete!")
+        print(f"\n{pfx}Worker done!")
+
+
+# ── Pipeline orchestrator ─────────────────────────────────────────────────────
+def run_pipeline(companies_xlsx, quarterly_limit, skip_kpi=False, num_workers=1):
+    df = pd.read_excel(companies_xlsx)
+    df.columns = [c.strip() for c in df.columns]
+    symbols = df["Symbol"].dropna().str.strip().tolist()
+    print(f"[✓] Loaded {len(symbols)} companies | limit={quarterly_limit} | workers={num_workers}\n")
+
+    PDF_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    if num_workers <= 1:
+        _process_symbols(symbols, quarterly_limit, skip_kpi, worker_id=0)
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        # Round-robin split: worker 0 gets symbols[0,N,2N,...], worker 1 gets symbols[1,N+1,...]
+        chunks = [symbols[i::num_workers] for i in range(num_workers)]
+        args_list = [
+            (chunk, quarterly_limit, skip_kpi, i + 1)
+            for i, chunk in enumerate(chunks) if chunk
+        ]
+        print(f"[✓] Dispatching {len(args_list)} workers "
+              f"({[len(a[0]) for a in args_list]} companies each)\n")
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_worker_entry, a): a[3] for a in args_list}
+            try:
+                for future in as_completed(futures):
+                    wid = futures[future]
+                    try:
+                        future.result()
+                        print(f"[W{wid}] Finished successfully")
+                    except Exception as e:
+                        print(f"[W{wid}] Exited with error: {e}")
+            except KeyboardInterrupt:
+                print("\n[!] Ctrl+C — waiting for workers to finish current PDF...")
+                executor.shutdown(wait=True, cancel_futures=False)
+
+    print("\n[✓] Pipeline complete!")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -756,6 +820,8 @@ def main():
                         help="Re-run Gemini KPI extraction on completed reports that have no KPI data yet")
     parser.add_argument("--purge-all",    action="store_true",
                         help="DANGER: wipe all DB tables and delete /pdfs + /output folders")
+    parser.add_argument("--workers",      type=int, default=1,
+                        help="Parallel workers for PDF extraction (default: 1, recommended: 2 on RTX 3090)")
     parser.add_argument("--companies",    default="companies.xlsx",
                         help="Path to companies Excel file (default: companies.xlsx)")
     args = parser.parse_args()
@@ -781,7 +847,7 @@ def main():
         import tempfile, pandas as pd
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         pd.DataFrame({"Symbol": [args.ticker]}).to_excel(tmp.name, index=False)
-        run_pipeline(tmp.name, args.limit, skip_kpi=args.no_kpi)  # single ticker
+        run_pipeline(tmp.name, args.limit, skip_kpi=args.no_kpi, num_workers=1)  # single ticker, no split
         return
 
     if args.delete:
@@ -791,7 +857,7 @@ def main():
     elif args.retry_failed:
         retry_failed()
     else:
-        run_pipeline(args.companies, args.limit, skip_kpi=args.no_kpi)
+        run_pipeline(args.companies, args.limit, skip_kpi=args.no_kpi, num_workers=args.workers)
 
 
 if __name__ == "__main__":
