@@ -32,10 +32,10 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "mysql.railway.internal"),
-    "port":     int(os.getenv("DB_PORT", 3306)),
+    "host":     os.getenv("DB_HOST", "shortline.proxy.rlwy.net"),
+    "port":     int(os.getenv("DB_PORT", 16759)),
     "user":     os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "vGYSrCJEbvGLdTijaSpWIQMRUJlHjuNl"),
+    "password": os.getenv("DB_PASSWORD", ""),
 }
 DB_NAME          = os.getenv("DB_NAME", "railway")
 PDF_BASE_URL     = os.getenv("PDF_BASE_URL", "https://cdn.cse.lk/")
