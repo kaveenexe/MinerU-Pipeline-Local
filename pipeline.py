@@ -299,7 +299,10 @@ def run_mineru(pdf_path):
     )
 
     result = subprocess.run(
-        ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-transformers", "--device", "cuda"],
+        ["mineru", "-p", str(pdf_path), "-o", str(out_dir),
+        "-b", "hybrid-http-client",
+        "--api-url", "http://127.0.0.1:8000",
+        "--device", "cuda"],
         env=env,
         capture_output=True,
         text=True
