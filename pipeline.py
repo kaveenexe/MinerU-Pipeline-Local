@@ -286,9 +286,17 @@ def run_mineru(pdf_path):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    env["VIRTUAL_VRAM_SIZE"]         = os.getenv("VIRTUAL_VRAM_SIZE", "6")
-    env["MINERU_HYBRID_BATCH_RATIO"] = os.getenv("MINERU_HYBRID_BATCH_RATIO", "2")
-    env["PYTORCH_CUDA_ALLOC_CONF"]   = "max_split_size_mb:512"
+    # Tuned for 2 workers on RTX 3090 24GB (11GB each = safe split)
+    # Override via .env: VIRTUAL_VRAM_SIZE=11, MINERU_HYBRID_BATCH_RATIO=4
+    env["VIRTUAL_VRAM_SIZE"] = os.getenv("VIRTUAL_VRAM_SIZE", "11")
+    env["MINERU_HYBRID_BATCH_RATIO"] = os.getenv("MINERU_HYBRID_BATCH_RATIO", "4")
+    # ONNX threading: 8 per worker × 2 workers = 16 of 24 vCPUs
+    env["MINERU_INTRA_OP_NUM_THREADS"] = os.getenv("MINERU_INTRA_OP_NUM_THREADS", "8")
+    # expandable_segments prevents fragmentation with concurrent CUDA processes
+    env["PYTORCH_CUDA_ALLOC_CONF"] = os.getenv(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "max_split_size_mb:512,expandable_segments:True"
+    )
 
     result = subprocess.run(
         ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "hybrid-auto-engine", "--device", "cuda"],
