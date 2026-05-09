@@ -287,7 +287,6 @@ def run_mineru(pdf_path):
     out_dir = OUTPUT_DIR / Path(pdf_path).stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Set env vars before calling the API
     os.environ["VIRTUAL_VRAM_SIZE"] = os.getenv("VIRTUAL_VRAM_SIZE", "11")
     os.environ["MINERU_HYBRID_BATCH_RATIO"] = os.getenv("MINERU_HYBRID_BATCH_RATIO", "4")
     os.environ["MINERU_INTRA_OP_NUM_THREADS"] = os.getenv("MINERU_INTRA_OP_NUM_THREADS", "8")
@@ -299,8 +298,8 @@ def run_mineru(pdf_path):
     do_parse(
         output_dir=str(out_dir),
         pdf_file_names=[str(pdf_path)],
-        parse_method="auto",          # auto = hybrid (text+VLM)
-        backend="vlm-transformers",   # no vllm/lmdeploy needed
+        parse_method="auto",
+        backend="vlm-transformers",
         lang=None,
     )
 
