@@ -282,27 +282,30 @@ def download_pdf(symbol, report):
 
 # ── MinerU Extraction ─────────────────────────────────────────────────────────
 def run_mineru(pdf_path):
-    from mineru.api import do_parse
-
     out_dir = OUTPUT_DIR / Path(pdf_path).stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    os.environ["VIRTUAL_VRAM_SIZE"] = os.getenv("VIRTUAL_VRAM_SIZE", "11")
-    os.environ["MINERU_HYBRID_BATCH_RATIO"] = os.getenv("MINERU_HYBRID_BATCH_RATIO", "4")
-    os.environ["MINERU_INTRA_OP_NUM_THREADS"] = os.getenv("MINERU_INTRA_OP_NUM_THREADS", "8")
-    os.environ["PYTORCH_ALLOC_CONF"] = os.getenv(
+    env = os.environ.copy()
+    env["VIRTUAL_VRAM_SIZE"] = os.getenv("VIRTUAL_VRAM_SIZE", "11")
+    env["MINERU_HYBRID_BATCH_RATIO"] = os.getenv("MINERU_HYBRID_BATCH_RATIO", "4")
+    env["MINERU_INTRA_OP_NUM_THREADS"] = os.getenv("MINERU_INTRA_OP_NUM_THREADS", "8")
+    env["PYTORCH_ALLOC_CONF"] = os.getenv(
         "PYTORCH_ALLOC_CONF",
         "max_split_size_mb:512,expandable_segments:True"
     )
+    env["MINERU_VL_SERVER"] = os.getenv("MINERU_VL_SERVER", "http://127.0.0.1:8000")
 
-    do_parse(
-        output_dir=str(out_dir),
-        pdf_file_names=[str(pdf_path)],
-        parse_method="auto",
-        backend="vlm-transformers",
-        lang=None,
+    result = subprocess.run(
+        ["mineru", "-p", str(pdf_path), "-o", str(out_dir),
+         "-b", "hybrid-http-client",
+         "--device", "cuda"],
+        env=env,
+        capture_output=True,
+        text=True
     )
-
+    if result.returncode != 0:
+        snippet = (result.stderr or result.stdout or "")[-600:]
+        raise RuntimeError(f"MinerU exited {result.returncode}: {snippet}")
     return out_dir
 
 
