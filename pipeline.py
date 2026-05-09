@@ -299,7 +299,7 @@ def run_mineru(pdf_path):
     )
 
     result = subprocess.run(
-        ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "hybrid-auto-engine", "--device", "cuda"],
+        ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-transformers", "--device", "cuda"],
         env=env,
         capture_output=True,
         text=True
