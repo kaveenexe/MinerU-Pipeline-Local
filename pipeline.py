@@ -109,6 +109,7 @@ def get_conn(with_db=True):
     cfg = DB_CONFIG.copy()
     if with_db:
         cfg["database"] = DB_NAME
+    cfg["use_pure"] = True
     return mysql.connector.connect(**cfg)
 
 
