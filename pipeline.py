@@ -28,6 +28,8 @@ import mysql.connector
 from dotenv import load_dotenv
 from kpi_extractor import extract_kpis
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -615,73 +617,84 @@ def _process_symbols(symbols, quarterly_limit, skip_kpi=False, worker_id=0):
     """
     Processes a list of company symbols end-to-end:
       download → MinerU → store → (optional KPI) → disk cleanup.
-    Called directly for single-worker mode; called inside _worker_entry for
-    multi-worker mode so each subprocess has its own DB connection.
+ 
+    Reports within each ticker are processed in parallel (up to 2 threads).
+    Each thread owns its own DB connection — MySQL connections are NOT thread-safe.
     """
     global _shutdown
     pfx = f"[W{worker_id}] " if worker_id > 0 else ""
-
+ 
     PDF_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
-
-    conn = get_conn()
-    cur  = conn.cursor()
+ 
+    # Outer connection — used only for INSERT IGNORE companies + commit per symbol.
+    outer_conn = get_conn()
+    outer_cur  = outer_conn.cursor()
     total = len(symbols)
-
+ 
     for ci, symbol in enumerate(symbols, 1):
         if _shutdown:
             break
-
+ 
         print(f"{pfx}[{ci:>3}/{total}] {symbol}")
-
+ 
         reports = fetch_quarterly_reports(symbol, quarterly_limit)
         if not reports:
             print(f"{pfx}  [!] No quarterly data — skipping")
             continue
-
-        cur.execute("INSERT IGNORE INTO companies (symbol) VALUES (%s)", (symbol,))
-        conn.commit()
-
-        for report in reports:
+ 
+        outer_cur.execute("INSERT IGNORE INTO companies (symbol) VALUES (%s)", (symbol,))
+        outer_conn.commit()
+ 
+        # ── Per-report worker ────────────────────────────────────────────────
+        def process_one_report(report):
+            """
+            Runs inside a thread. Opens its own DB connection so that concurrent
+            reports for the same ticker never share cursor state.
+            """
             if _shutdown:
-                break
-
+                return
+ 
+            # Each thread gets its own connection + cursor.
+            conn = get_conn()
+            cur  = conn.cursor()
+ 
             cse_id    = report["id"]
             file_text = report.get("fileText", "")
             pdf_url   = PDF_BASE_URL + report["path"]
             state     = get_state(cur, symbol, cse_id)
-
+ 
             if state in ("completed", "deleted"):
                 print(f"{pfx}  [skip] {file_text[:65]} ({state})")
-                continue
-
+                cur.close()
+                conn.close()
+                return
+ 
             print(f"{pfx}  ↳ {file_text[:70]}")
-
+ 
             if state is None:
-                set_state(cur, symbol, cse_id, "queued", file_text, pdf_url)
-                conn.commit()
+                set_state(cur, conn, symbol, cse_id, "queued", file_text, pdf_url)
                 state = "queued"
-
-            # ── Step 1: Download PDF ──────────────────────────
+ 
+            # ── Step 1: Download PDF ──────────────────────────────────────────
             pdf_local_path = None
             if state == "queued":
                 try:
                     print(f"{pfx}    [1/3] Downloading...")
                     pdf_local_path = download_pdf(symbol, report)
-                    set_state(cur, symbol, cse_id, "pdf_downloaded", file_text, pdf_url)
-                    conn.commit()
+                    set_state(cur, conn, symbol, cse_id, "pdf_downloaded", file_text, pdf_url)
                     state = "pdf_downloaded"
                     print(f"{pfx}    [✓] Saved: {pdf_local_path}")
                 except Exception as e:
-                    set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
-                    conn.commit()
+                    set_state(cur, conn, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                     print(f"{pfx}    [✗] Download failed: {e}")
-                    continue
+                    cur.close(); conn.close()
+                    return
             else:
                 cur.execute(
                     "SELECT pdf_local_path FROM reports "
                     "WHERE company_symbol=%s AND cse_report_id=%s",
-                    (symbol, cse_id)
+                    (symbol, cse_id),
                 )
                 row = cur.fetchone()
                 if row and row[0] and Path(row[0]).exists():
@@ -692,36 +705,34 @@ def _process_symbols(symbols, quarterly_limit, skip_kpi=False, worker_id=0):
                         pdf_local_path = download_pdf(symbol, report)
                         state = "pdf_downloaded"
                     except Exception as e:
-                        set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
-                        conn.commit()
+                        set_state(cur, conn, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                         print(f"{pfx}    [✗] Re-download failed: {e}")
-                        continue
-
-            # ── Step 2: MinerU Extraction ─────────────────────
+                        cur.close(); conn.close()
+                        return
+ 
+            # ── Step 2: MinerU Extraction ─────────────────────────────────────
             if state in ("queued", "pdf_downloaded"):
                 try:
                     print(f"{pfx}    [2/3] Running MinerU...")
                     run_mineru(pdf_local_path)
-                    set_state(cur, symbol, cse_id, "mineru_extracted", file_text, pdf_url)
-                    conn.commit()
+                    set_state(cur, conn, symbol, cse_id, "mineru_extracted", file_text, pdf_url)
                     state = "mineru_extracted"
                     print(f"{pfx}    [✓] Extraction complete")
                 except Exception as e:
-                    set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
-                    conn.commit()
+                    set_state(cur, conn, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                     print(f"{pfx}    [✗] MinerU failed: {e}")
-                    continue
-
-            # ── Step 3: Store in MySQL ────────────────────────
+                    cur.close(); conn.close()
+                    return
+ 
+            # ── Step 3: Store in MySQL ────────────────────────────────────────
             if state in ("queued", "pdf_downloaded", "mineru_extracted"):
                 try:
                     print(f"{pfx}    [3/3] Storing in MySQL...")
                     n = store_report(conn, cur, symbol, report, pdf_local_path)
-                    set_state(cur, symbol, cse_id, "completed", file_text, pdf_url)
-                    conn.commit()
+                    set_state(cur, conn, symbol, cse_id, "completed", file_text, pdf_url)
                     print(f"{pfx}    [✓] Stored {n} blocks")
-
-                    # ── Step 4: KPI extraction (optional) ────────────────────
+ 
+                    # ── Step 4: KPI extraction (optional) ──────────────────────
                     if skip_kpi:
                         print(f"{pfx}    [skip] KPI step skipped (--no-kpi flag)")
                     else:
@@ -731,8 +742,9 @@ def _process_symbols(symbols, quarterly_limit, skip_kpi=False, worker_id=0):
                                 print(f"{pfx}    [4/4] Extracting KPIs via Gemini...")
                                 period_label = f"report-{cse_id}"
                                 cur.execute(
-                                    "SELECT id FROM reports WHERE company_symbol=%s AND cse_report_id=%s",
-                                    (symbol, cse_id)
+                                    "SELECT id FROM reports "
+                                    "WHERE company_symbol=%s AND cse_report_id=%s",
+                                    (symbol, cse_id),
                                 )
                                 row = cur.fetchone()
                                 report_db_id = row[0] if row else 0
@@ -746,26 +758,41 @@ def _process_symbols(symbols, quarterly_limit, skip_kpi=False, worker_id=0):
                                 print(f"{pfx}    [!] KPI extraction failed (non-fatal): {ke}")
                         else:
                             print(f"{pfx}    [!] content_list_v2.json not found, skipping KPI step")
-
-                    # ── Disk cleanup: remove MinerU output to preserve disk ───
+ 
+                    # ── Disk cleanup ────────────────────────────────────────────
                     out_stem = OUTPUT_DIR / Path(pdf_local_path).stem
                     if out_stem.exists():
                         shutil.rmtree(out_stem)
                         print(f"{pfx}    [✓] MinerU output cleaned (disk freed)")
-
+ 
                 except Exception as e:
-                    set_state(cur, symbol, cse_id, "failed", file_text, pdf_url, str(e))
-                    conn.commit()
+                    set_state(cur, conn, symbol, cse_id, "failed", file_text, pdf_url, str(e))
                     print(f"{pfx}    [✗] Storage failed: {e}")
-                    continue
-
-    cur.close()
-    conn.close()
-
+ 
+            cur.close()
+            conn.close()
+ 
+        # ── Run reports for this ticker in parallel ───────────────────────────
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(process_one_report, r): r for r in reports}
+            for fut in as_completed(futures):
+                if _shutdown:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                exc = fut.exception()
+                if exc:
+                    # process_one_report handles its own exceptions internally;
+                    # this catches anything unexpected that escaped.
+                    print(f"{pfx}  [!] Unhandled thread error: {exc}")
+ 
+    outer_cur.close()
+    outer_conn.close()
+ 
     if _shutdown:
         print(f"\n{pfx}Pipeline paused safely. Run again to resume.")
     else:
         print(f"\n{pfx}Worker done!")
+
 
 
 # ── Pipeline orchestrator ─────────────────────────────────────────────────────
@@ -831,7 +858,10 @@ def main():
                         help="Parallel workers for PDF extraction (default: 1, recommended: 2 on RTX 3090)")
     parser.add_argument("--companies",    default="companies.xlsx",
                         help="Path to companies Excel file (default: companies.xlsx)")
+    parser.add_argument('--tickers', metavar='TICKER', nargs='+',
+                    help='Run pipeline for specific tickers e.g. HNB.N0000 COMB.N0000')
     args = parser.parse_args()
+    
 
     init_database()
 
@@ -850,11 +880,17 @@ def main():
         return
 
     if args.ticker:
-        # Single-ticker run — create a temp one-row companies source
         import tempfile, pandas as pd
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         pd.DataFrame({"Symbol": [args.ticker]}).to_excel(tmp.name, index=False)
-        run_pipeline(tmp.name, args.limit, skip_kpi=args.no_kpi, num_workers=1)  # single ticker, no split
+        run_pipeline(tmp.name, args.limit, skip_kpi=args.no_kpi, num_workers=args.workers)
+        return
+
+    if args.tickers:
+        import tempfile, pandas as pd
+        tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        pd.DataFrame({"Symbol": args.tickers}).to_excel(tmp.name, index=False)
+        run_pipeline(tmp.name, args.limit, skip_kpi=args.no_kpi, num_workers=args.workers)
         return
 
     if args.delete:
