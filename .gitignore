@@ -222,3 +222,5 @@ __marimo__/
 /output
 /pdfs
 .idea
+/test_markdown
+*.sql*

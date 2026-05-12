@@ -533,15 +533,15 @@ def store_kpis(conn, cur, symbol, report_db_id, kpi_result):
         """, rows)
 
 
-def run_kpi_only(companies_xlsx, limit):
+def run_kpi_only(symbols: list, limit: int):
     """
-    Re-run Gemini KPI extraction on all completed reports
-    (reports that already have MinerU output but no/incomplete KPI data).
+    Re-run Gemini KPI extraction on completed reports with no/incomplete KPI data.
+
+    Data source priority per report:
+      1. content_list_v2.json on disk  (original file-based path)
+      2. report_blocks table in DB     (fallback when files were deleted)
     """
-    import pandas as pd
-    df  = pd.read_excel(companies_xlsx)
-    df.columns = [c.strip() for c in df.columns]
-    symbols = df["Symbol"].dropna().str.strip().tolist()
+    from kpi_extractor import extract_kpis_from_db  # DB-based extractor
 
     conn = get_conn()
     cur  = conn.cursor()
@@ -557,7 +557,10 @@ def run_kpi_only(companies_xlsx, limit):
         """, (symbol, limit))
         rep_rows = cur.fetchall()
         if not rep_rows:
+            print(f"  [!] {symbol} — no reports in DB, skipping")
             continue
+
+        print(f"\n[→] {symbol} — {len(rep_rows)} report(s) to check")
 
         for report_db_id, cse_report_id, pdf_local_path in rep_rows:
             # Skip if KPI already extracted (has at least one tier1 row)
@@ -567,22 +570,26 @@ def run_kpi_only(companies_xlsx, limit):
             """, (symbol, report_db_id))
             kpi_count = cur.fetchone()[0]
             if kpi_count > 0:
-                print(f"  [skip] {symbol} report {cse_report_id} — {kpi_count} KPIs already present")
+                print(f"  [skip] report {cse_report_id} — {kpi_count} Tier1 KPIs already present")
                 continue
 
-            if not pdf_local_path:
-                print(f"  [!] {symbol} report {cse_report_id} — no pdf_local_path, skipping")
-                continue
+            period_label = f"report-{cse_report_id}"
+            print(f"  → Extracting KPIs: {symbol} / {period_label}")
 
-            _, v2_path, _ = find_output_files(pdf_local_path)
-            if not v2_path or not v2_path.exists():
-                print(f"  [!] {symbol} report {cse_report_id} — content_list_v2.json not found")
-                continue
+            # ── Source 1: v2 JSON file on disk ────────────────────────────────
+            v2_path = None
+            if pdf_local_path:
+                _, v2_path, _ = find_output_files(pdf_local_path)
 
-            print(f"  → KPI extraction: {symbol} report {cse_report_id}")
             try:
-                period_label = f"report-{cse_report_id}"
-                kpi_result   = extract_kpis(v2_path, symbol, period_label)
+                if v2_path and v2_path.exists():
+                    print(f"    [src] File: {v2_path.name}")
+                    kpi_result = extract_kpis(v2_path, symbol, period_label)
+                else:
+                    # ── Source 2: report_blocks in DB ─────────────────────────
+                    print(f"    [src] DB (v2 file not found — using report_blocks)")
+                    kpi_result = extract_kpis_from_db(cur, report_db_id, symbol, period_label)
+
                 store_kpis(conn, cur, symbol, report_db_id, kpi_result)
                 conn.commit()
                 t1 = sum(1 for v in kpi_result.get("tier1", {}).values() if v is not None)
@@ -595,6 +602,7 @@ def run_kpi_only(companies_xlsx, limit):
     cur.close()
     conn.close()
     print(f"\n[✓] KPI extraction complete — {total} reports processed")
+
 
 
 # ── Worker entry point (must be module-level to be picklable) ─────────────────
@@ -877,13 +885,17 @@ def main():
     init_database()
 
     if args.kpi_only:
-        companies_file = args.companies
+        # Build the symbol list from --ticker / --tickers / --companies
         if args.ticker:
-            import tempfile, pandas as pd
-            tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-            pd.DataFrame({"Symbol": [args.ticker]}).to_excel(tmp.name, index=False)
-            companies_file = tmp.name
-        run_kpi_only(companies_file, args.limit)
+            symbols = [args.ticker]
+        elif args.tickers:
+            symbols = args.tickers
+        else:
+            import pandas as pd
+            df = pd.read_excel(args.companies)
+            df.columns = [c.strip() for c in df.columns]
+            symbols = df["Symbol"].dropna().str.strip().tolist()
+        run_kpi_only(symbols, args.limit)
         return
 
     if args.purge_all:
