@@ -57,4 +57,7 @@ Replace every call to `call_gemini(prompt)` in the file with `call_ai(prompt)`. 
 
 Replace `"Sending to Gemini"` and `"Waiting for Gemini response..."` log strings to dynamically use the backend name, e.g. `f"Sending to {AI_BACKEND.upper()}"`.
 
-NVIDIA NIM free tier is 40 requests per minute. Gemini has no such limit so rate limiting should only activate when `AI_BACKEND=nvidia`.
+---
+
+- NVIDIA NIM free tier is 40 requests per minute. Gemini has no such limit so rate limiting should only activate when `AI_BACKEND=nvidia`.
+- Add .env variable `NIM_MAX_RPM=38`

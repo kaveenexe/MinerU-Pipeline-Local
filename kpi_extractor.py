@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 kpi_extractor.py
-Extracts KPIs from financial reports via Gemini Flash.
+Extracts KPIs from financial reports via Gemini Flash or NVIDIA NIM.
+
+Two AI backends supported (set AI_BACKEND in .env):
+  gemini  — Google Gemini Flash (default)
+  nvidia  — NVIDIA NIM (OpenAI-compatible, e.g. deepseek-ai/deepseek-v3)
 
 Two data sources are supported:
   1. File-based  — reads content_list_v2.json produced by MinerU (original path)
@@ -22,31 +26,67 @@ Usage (standalone — DB source, requires .env with DB creds):
 
 import os
 import re
+import time
 import json
 import argparse
 from pathlib import Path
-import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-_model = genai.GenerativeModel("gemini-2.5-flash")
+# ── AI Backend selection ───────────────────────────────────────────────────────
+AI_BACKEND    = os.getenv("AI_BACKEND", "gemini").lower().strip()
+NIM_MAX_RPM   = int(os.getenv("NIM_MAX_RPM", 38))   # NVIDIA free tier = 40 rpm
+_nim_req_times: list[float] = []                      # rolling window for rate limiting
+
+if AI_BACKEND == "nvidia":
+    from openai import OpenAI as _OpenAI
+    _nim_client = _OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=os.getenv("NVIDIA_API_KEY"),
+    )
+    NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v3")
+    print(f"[AI] Backend: NVIDIA NIM  model={NVIDIA_MODEL}  max_rpm={NIM_MAX_RPM}")
+else:
+    import google.generativeai as genai
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    _model = genai.GenerativeModel("gemini-2.5-flash")
+    print(f"[AI] Backend: Gemini Flash")
 
 # ─── Statement heading patterns ───────────────────────────────────────────────
 INCOME_PATTERNS = [
-    "income statement", "statement of comprehensive income",
-    "statement of profit or loss", "profit or loss",
-    "condensed interim income", "statement of income",
+    "income statement",
+    "statement of comprehensive income",
+    "statement of profit or loss",
+    "profit or loss",
+    "condensed interim income",
+    "statement of income",
     "comprehensive income",
+    "profit or loss and other comprehensive income",  # common combined heading
+    "income and expenditure",                          # some older reports
+    "results of operations",
 ]
+
 BALANCE_PATTERNS = [
-    "statement of financial position", "balance sheet",
-    "financial position", "assets and liabilities",
+    "statement of financial position",
+    "balance sheet",
+    "financial position",
+    "assets and liabilities",
+    "condensed interim statement of financial position",
+    "interim statement of financial position",
+    "consolidated statement of financial position",
+    "statements of financial position",               # plural variant
+    "financial position as at",                       # with date suffix
+    "position as at",                                 # truncated variant
 ]
+
 CASHFLOW_PATTERNS = [
-    "statement of cash flows", "cash flow statement",
+    "statement of cash flows",
+    "cash flow statement",
     "cash flows",
+    "condensed interim statement of cash flows",      # same pattern as balance
+    "cash flows from operating",                      # partial match from table body
+    "cash generated from",                            # alternative phrasing
 ]
 
 def classify_heading(text: str) -> str | None:
@@ -279,20 +319,55 @@ def build_prompt(tagged_tables: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def call_gemini(prompt: str) -> dict:
-    """Send prompt to Gemini Flash and parse JSON response."""
+def _nim_rate_limit() -> None:
+    """Block if we are about to exceed NIM_MAX_RPM requests per minute."""
+    now = time.monotonic()
+    # Keep only timestamps from the last 60 s
+    _nim_req_times[:] = [t for t in _nim_req_times if now - t < 60]
+    if len(_nim_req_times) >= NIM_MAX_RPM:
+        wait = 60 - (now - _nim_req_times[0]) + 0.5
+        print(f"      [AI] NIM rate limit reached — waiting {wait:.1f}s...")
+        time.sleep(wait)
+    _nim_req_times.append(time.monotonic())
+
+
+def call_ai(prompt: str) -> dict:
+    """Send prompt to the configured AI backend and return parsed JSON."""
     prompt_chars = len(prompt)
-    print(f"      [AI] Sending to Gemini — prompt size: {prompt_chars:,} chars (~{prompt_chars // 4:,} tokens)")
-    print(f"      [AI] Waiting for Gemini response...")
-    response = _model.generate_content(
-        [SYSTEM_PROMPT, prompt],
-        generation_config={"temperature": 0},
-    )
-    raw = response.text.strip()
+    backend_label = AI_BACKEND.upper()
+    print(f"      [AI] Sending to {backend_label} — prompt size: {prompt_chars:,} chars (~{prompt_chars // 4:,} tokens)")
+    print(f"      [AI] Waiting for {backend_label} response...")
+
+    if AI_BACKEND == "nvidia":
+        _nim_rate_limit()
+        response = _nim_client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=2048,
+        )
+        raw = response.choices[0].message.content.strip()
+    else:
+        response = _model.generate_content(
+            [SYSTEM_PROMPT, prompt],
+            generation_config={"temperature": 0},
+        )
+        raw = response.text.strip()
+
     print(f"      [AI] Response received — {len(raw):,} chars")
+
     # Strip markdown fences if model adds them anyway
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"```\s*$",         "", raw, flags=re.MULTILINE)
+
+    # Safety: extract the first valid JSON object in case of surrounding text
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if match:
+        raw = match.group(0)
+
     parsed = json.loads(raw)
     print(f"      [AI] JSON parsed successfully")
     return parsed
@@ -463,7 +538,7 @@ def _validate_and_correct(
 
     correction_prompt = _build_correction_prompt(final_prompt, violations, tier1)
     try:
-        result_c     = call_gemini(correction_prompt)
+        result_c     = call_ai(correction_prompt)
         tier1_c      = result_c.get("tier1", {})
         tier2_c      = result_c.get("tier2", {})
         violations_c = validate_tier1(tier1_c)
@@ -506,11 +581,11 @@ def extract_kpis(v2_path: Path, symbol: str = "", period: str = "") -> dict:
             print(f"      [AI] Fallback: using {len(financial_tables)} complex_table(s) (no statement headings found)")
 
     if not financial_tables:
-        print(f"      [AI] ✗ No financial tables found — skipping Gemini call")
+        print(f"      [AI] ✗ No financial tables found — skipping {AI_BACKEND.upper()} call")
         return {"symbol": symbol, "period": period, "tier1": {}, "tier2": {}, "error": "no_financial_tables_found"}
 
     prompt = build_prompt(financial_tables)
-    result = call_gemini(prompt)
+    result = call_ai(prompt)
     final_prompt = prompt   # track which prompt produced the accepted result
 
     tier1 = result.get("tier1", {})
@@ -525,7 +600,7 @@ def extract_kpis(v2_path: Path, symbol: str = "", period: str = "") -> dict:
             f"retrying with all {len(tagged)} tables (headings may not have matched)..."
         )
         prompt2 = build_prompt(tagged)
-        result2 = call_gemini(prompt2)
+        result2 = call_ai(prompt2)
 
         tier1_2  = result2.get("tier1", {})
         t1_found2 = {k: v for k, v in tier1_2.items() if v is not None}
@@ -585,11 +660,11 @@ def extract_kpis_from_db(cur, report_db_id: int, symbol: str = "", period: str =
             print(f"      [AI] Fallback: using {len(financial_tables)} complex_table(s)")
 
     if not financial_tables:
-        print(f"      [AI] ✗ No financial tables found — skipping Gemini call")
+        print(f"      [AI] ✗ No financial tables found — skipping {AI_BACKEND.upper()} call")
         return {"symbol": symbol, "period": period, "tier1": {}, "tier2": {}, "error": "no_financial_tables_found"}
 
     prompt = build_prompt(financial_tables)
-    result = call_gemini(prompt)
+    result = call_ai(prompt)
     final_prompt = prompt   # track which prompt produced the accepted result
 
     tier1    = result.get("tier1", {})
@@ -604,7 +679,7 @@ def extract_kpis_from_db(cur, report_db_id: int, symbol: str = "", period: str =
             f"retrying with all {len(tagged)} tables..."
         )
         prompt2   = build_prompt(tagged)
-        result2   = call_gemini(prompt2)
+        result2   = call_ai(prompt2)
         tier1_2   = result2.get("tier1", {})
         t1_found2 = {k: v for k, v in tier1_2.items() if v is not None}
         if len(t1_found2) > len(t1_found):

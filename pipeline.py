@@ -879,6 +879,10 @@ def main():
                         help="Path to companies Excel file (default: companies.xlsx)")
     parser.add_argument('--tickers', metavar='TICKER', nargs='+',
                     help='Run pipeline for specific tickers e.g. HNB.N0000 COMB.N0000')
+    parser.add_argument('--batch',        type=int, default=None, metavar='N',
+                        help='Process only N companies from the list (use with --batch-offset to paginate)')
+    parser.add_argument('--batch-offset', type=int, default=0,   metavar='K',
+                        help='Skip the first K companies before applying --batch (default: 0)')
     args = parser.parse_args()
     
 
@@ -895,6 +899,15 @@ def main():
             df = pd.read_excel(args.companies)
             df.columns = [c.strip() for c in df.columns]
             symbols = df["Symbol"].dropna().str.strip().tolist()
+
+        # Apply batch slicing if requested
+        if args.batch is not None:
+            total_symbols = len(symbols)
+            start = args.batch_offset
+            end   = start + args.batch
+            symbols = symbols[start:end]
+            print(f"[batch] {len(symbols)} companies (#{start+1}–#{min(end, total_symbols)} of {total_symbols})")
+
         run_kpi_only(symbols, args.limit)
         return
 
