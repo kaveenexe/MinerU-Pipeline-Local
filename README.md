@@ -78,3 +78,5 @@ mineru/
 -- Export from mineru_cse, import into ceylonstreet DB
 -- The schema is designed to be portable — just migrate the 4 tables
 ```
+
+[Guide to run the pipeline again in RunPod](https://github.com/kaveenexe/MinerU-Pipeline-Local/blob/main/)
